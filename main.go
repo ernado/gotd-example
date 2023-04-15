@@ -5,6 +5,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -23,14 +24,18 @@ import (
 	"github.com/gotd/td/telegram/auth"
 	"github.com/gotd/td/telegram/message/peer"
 	"github.com/gotd/td/telegram/query"
+	"github.com/gotd/td/telegram/updates"
+	updhook "github.com/gotd/td/telegram/updates/hook"
 	"github.com/gotd/td/tg"
 	"github.com/joho/godotenv"
+	bolt "go.etcd.io/bbolt"
+	"go.uber.org/multierr"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/term"
 	"golang.org/x/time/rate"
-	"gopkg.in/natefinch/lumberjack.v2"
+	lj "gopkg.in/natefinch/lumberjack.v2"
 )
 
 // terminalAuth implements auth.UserAuthenticator prompting the terminal for
@@ -79,7 +84,7 @@ func sessionFolder(phone string) string {
 	return "phone-" + string(out)
 }
 
-func run(ctx context.Context) error {
+func run(ctx context.Context) (rerr error) {
 	var arg struct {
 		FillPeerStorage bool
 	}
@@ -121,7 +126,7 @@ func run(ctx context.Context) error {
 	// Setting up logging to file with rotation.
 	//
 	// Log to file, so we don't interfere with prompts and messages to user.
-	logWriter := zapcore.AddSync(&lumberjack.Logger{
+	logWriter := zapcore.AddSync(&lj.Logger{
 		Filename:   logFilePath,
 		MaxBackups: 3,
 		MaxSize:    1, // megabytes
@@ -144,6 +149,18 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return errors.Wrap(err, "create pebble storage")
 	}
+	defer func() {
+		// Ensuring that db is closed correctly.
+		closeErr := db.Close()
+		if closeErr == nil {
+			return
+		}
+		if rerr == nil {
+			multierr.AppendInto(&rerr, closeErr)
+		} else {
+			rerr = closeErr
+		}
+	}()
 	peerDB := pebble.NewPeerStorage(db)
 	lg.Info("Storage", zap.String("path", sessionDir))
 
@@ -153,7 +170,50 @@ func run(ctx context.Context) error {
 	dispatcher := tg.NewUpdateDispatcher()
 	// Setting up update handler that will fill peer storage before
 	// calling dispatcher handlers.
-	updateHandler := storage.UpdateHook(dispatcher, peerDB)
+	//
+	// Wrapping dispatcher (previous update handler) via UpdateHook.
+	peerDBHandler := storage.UpdateHook(dispatcher, peerDB)
+
+	// Setting up updates recovery handler that will fetch missing updates
+	// after restart or reconnect.
+	//
+	// First, we need to store state of updates handler. If no storage,
+	// only reconnects can be handled.
+	//
+	// The BoltState is state storage implementation based on bbolt.
+	stateDB, err := bolt.Open(filepath.Join(sessionDir, "updates.state.bbolt"), fs.ModePerm, bolt.DefaultOptions)
+	if err != nil {
+		return errors.Wrap(err, "state database")
+	}
+	defer func() {
+		// Ensuring that state database is closed correctly.
+		closeErr := stateDB.Close()
+		if closeErr == nil {
+			return
+		}
+		if rerr == nil {
+			multierr.AppendInto(&rerr, closeErr)
+		} else {
+			rerr = closeErr
+		}
+	}()
+	updatesHandler := updates.New(updates.Config{
+		// Wrapping previous handler.
+		Handler: storage.UpdateHook(peerDBHandler, peerDB),
+		Storage: NewBoltState(stateDB),
+		Logger:  lg.Named("gaps"),
+	})
+	defer func() {
+		closeErr := updatesHandler.Logout()
+		if closeErr == nil {
+			return
+		}
+		if rerr == nil {
+			multierr.AppendInto(&rerr, closeErr)
+		} else {
+			rerr = closeErr
+		}
+	}()
 
 	// Handler of FLOOD_WAIT that will automatically retry request.
 	waiter := floodwait.NewWaiter().WithCallback(func(ctx context.Context, wait floodwait.FloodWait) {
@@ -166,12 +226,17 @@ func run(ctx context.Context) error {
 	options := telegram.Options{
 		Logger:         lg,             // Passing logger for observability.
 		SessionStorage: sessionStorage, // Setting up session sessionStorage to store auth data.
-		UpdateHandler:  updateHandler,  // Setting up handler for updates from server.
+		UpdateHandler:  updatesHandler, // Setting up handler for updates from server.
 		Middlewares: []telegram.Middleware{
 			// Setting up FLOOD_WAIT handler to automatically wait and retry request.
+			//
+			// NB: If disabled, you will get FLOOD_WAIT errors and will need to retry manually.
 			waiter,
 			// Setting up general rate limits to less likely get flood wait errors.
 			ratelimit.New(rate.Every(time.Millisecond*100), 5),
+
+			// NB: This is critical for updates handler to work.
+			updhook.UpdateHook(updatesHandler.Handle),
 		},
 	}
 	client := telegram.NewClient(appID, appHash, options)
@@ -201,6 +266,15 @@ func run(ctx context.Context) error {
 		}
 
 		fmt.Printf("%s: %s\n", p, msg.Message)
+
+		// Marking message as read.
+		if _, err := api.MessagesReadHistory(ctx, &tg.MessagesReadHistoryRequest{
+			Peer:  p.AsInputPeer(),
+			MaxID: msg.ID,
+		}); err != nil {
+			return errors.Wrap(err, "read history")
+		}
+
 		return nil
 	})
 
@@ -209,7 +283,7 @@ func run(ctx context.Context) error {
 
 	wg, ctx := errgroup.WithContext(ctx)
 	wg.Go(func() error {
-		// This is important for waiter to work!
+		// NB: This is critical for waiter to work!
 		// Spawning separate goroutine to handle FLOOD_WAIT.
 		return waiter.Run(ctx)
 	})
@@ -232,6 +306,18 @@ func run(ctx context.Context) error {
 			self, err := client.Self(ctx)
 			if err != nil {
 				return errors.Wrap(err, "call self")
+			}
+
+			// Notify update manager about authentication.
+			//
+			// NB: this is critical for updates handler to work.
+			if err := updatesHandler.Auth(ctx, api, self.ID, self.Bot, true); err != nil {
+				return errors.Wrap(err, "auth updates handler notify")
+			}
+
+			// Setting account status to online.
+			if _, err := api.AccountUpdateStatus(ctx, false); err != nil {
+				return errors.Wrap(err, "call account.updateStatus")
 			}
 
 			name := self.FirstName
