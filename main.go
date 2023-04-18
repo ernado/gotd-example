@@ -203,17 +203,6 @@ func run(ctx context.Context) (rerr error) {
 		Storage: NewBoltState(stateDB),
 		Logger:  lg.Named("gaps"),
 	})
-	defer func() {
-		closeErr := updatesHandler.Logout()
-		if closeErr == nil {
-			return
-		}
-		if rerr == nil {
-			multierr.AppendInto(&rerr, closeErr)
-		} else {
-			rerr = closeErr
-		}
-	}()
 
 	// Handler of FLOOD_WAIT that will automatically retry request.
 	waiter := floodwait.NewWaiter().WithCallback(func(ctx context.Context, wait floodwait.FloodWait) {
@@ -242,8 +231,8 @@ func run(ctx context.Context) (rerr error) {
 	client := telegram.NewClient(appID, appHash, options)
 	api := client.API()
 
-	// Setting up resolver cache that will use peer storage.
-	resolver := storage.NewResolverCache(peer.Plain(api), peerDB)
+	// You can also use peer resolver cache to resolve peers.
+	_ = storage.NewResolverCache(peer.Plain(api), peerDB)
 
 	// Registering handler for new private messages.
 	dispatcher.OnNewMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateNewMessage) error {
@@ -277,47 +266,82 @@ func run(ctx context.Context) (rerr error) {
 
 		return nil
 	})
+	dispatcher.OnNewChannelMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateNewChannelMessage) error {
+		msg, ok := u.Message.(*tg.Message)
+		if !ok {
+			return nil
+		}
+		if msg.Out {
+			// Outgoing message.
+			return nil
+		}
+
+		// Use PeerID to find peer because *Short updates does not contain any entities, so it necessary to
+		// store some entities.
+		//
+		// Storage can be filled using PeerCollector (i.e. fetching all dialogs first).
+		p, err := storage.FindPeer(ctx, peerDB, msg.GetPeerID())
+		if err != nil {
+			lg.Error("Find peer", zap.Error(err))
+			return errors.Wrap(err, "find peer")
+		}
+
+		fmt.Printf("%s: %s\n", p, msg.Message)
+
+		channel, ok := p.AsInputChannel()
+		if !ok {
+			return errors.New("not a channel")
+		}
+		if _, err := api.ChannelsReadHistory(ctx, &tg.ChannelsReadHistoryRequest{
+			Channel: channel,
+			MaxID:   msg.ID,
+		}); err != nil {
+			return errors.Wrap(err, "read history")
+		}
+
+		return nil
+	})
 
 	// Authentication flow handles authentication process, like prompting for code and 2FA password.
 	authFlow := auth.NewFlow(terminalAuth{phone: phone}, auth.SendCodeOptions{})
 
-	wg, ctx := errgroup.WithContext(ctx)
-	wg.Go(func() error {
-		// NB: This is critical for waiter to work!
-		// Spawning separate goroutine to handle FLOOD_WAIT.
-		return waiter.Run(ctx)
-	})
-	wg.Go(func() error {
-		// Spawning main goroutine.
-		if err := client.Run(ctx, func(ctx context.Context) error {
-			if self, err := client.Self(ctx); err != nil || self.Bot {
-				// Starting authentication flow.
-				fmt.Println("Not logged in: starting auth")
-				lg.Info("Starting authentication flow")
-				if err := authFlow.Run(ctx, client.Auth()); err != nil {
-					return errors.Wrap(err, "auth")
-				}
-			} else {
-				fmt.Println("Already logged in")
-				lg.Info("Already authenticated")
+	handler := func(ctx context.Context) error {
+		if self, err := client.Self(ctx); err != nil || self.Bot {
+			// Starting authentication flow.
+			fmt.Println("Not logged in: starting auth")
+			lg.Info("Starting authentication flow")
+			if err := authFlow.Run(ctx, client.Auth()); err != nil {
+				return errors.Wrap(err, "auth")
 			}
+		} else {
+			fmt.Println("Already logged in")
+			lg.Info("Already authenticated")
+		}
 
-			// Getting info about current user.
-			self, err := client.Self(ctx)
-			if err != nil {
-				return errors.Wrap(err, "call self")
-			}
+		// Getting info about current user.
+		self, err := client.Self(ctx)
+		if err != nil {
+			return errors.Wrap(err, "call self")
+		}
 
-			// Notify update manager about authentication.
+		ready := make(chan struct{})
+		wg, ctx := errgroup.WithContext(ctx)
+		wg.Go(func() error {
+			// Start update manager.
 			//
 			// NB: this is critical for updates handler to work.
-			if err := updatesHandler.Auth(ctx, api, self.ID, self.Bot, true); err != nil {
-				return errors.Wrap(err, "auth updates handler notify")
-			}
-
-			// Setting account status to online.
-			if _, err := api.AccountUpdateStatus(ctx, false); err != nil {
-				return errors.Wrap(err, "call account.updateStatus")
+			return updatesHandler.Run(ctx, api, self.ID, updates.AuthOptions{
+				OnStart: func(ctx context.Context) {
+					close(ready)
+					lg.Info("Updates handler started")
+				},
+			})
+		})
+		wg.Go(func() error {
+			select {
+			case <-ready:
+			case <-ctx.Done():
+				return ctx.Err()
 			}
 
 			name := self.FirstName
@@ -343,24 +367,22 @@ func run(ctx context.Context) (rerr error) {
 				fmt.Println("Filled")
 			}
 
-			lg.Info("Resolving https://t.me/tdlibchat")
-			// This should be cached in peer storage after first time.
-			if _, err := resolver.ResolveDomain(ctx, "tdlibchat"); err != nil {
-				return errors.Wrap(err, "resolve")
-			}
-			lg.Info("Resolved")
+			return nil
+		})
 
-			// Waiting until context is done.
-			fmt.Println("Listening for updates. Interrupt (Ctrl+C) to stop.")
-			<-ctx.Done()
-			return ctx.Err()
-		}); err != nil {
-			return errors.Wrap(err, "run")
-		}
-		return nil
-	})
+		// Waiting until context is done.
+		fmt.Println("Listening for updates. Interrupt (Ctrl+C) to stop.")
+		return wg.Wait()
+	}
 
-	return wg.Wait()
+	if err := waiter.Run(ctx, func(ctx context.Context) error {
+		// Client should be started after waiter.
+		return client.Run(ctx, handler)
+	}); err != nil {
+		return errors.Wrap(err, "run client")
+	}
+
+	return nil
 }
 
 func main() {
