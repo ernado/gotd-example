@@ -5,7 +5,7 @@ go 1.20
 require (
 	github.com/cockroachdb/pebble v0.0.0-20230420172751-f87a15b23a26
 	github.com/go-faster/errors v0.6.1
-	github.com/gotd/contrib v0.16.0
+	github.com/gotd/contrib v0.16.1-0.20230422010918-501bc8b6f65f
 	github.com/gotd/td v0.80.0-alpha.0
 	github.com/joho/godotenv v1.5.1
 	go.etcd.io/bbolt v1.3.7
@@ -20,7 +20,7 @@ require (
 require (
 	github.com/DataDog/zstd v1.4.5 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
-	github.com/cenkalti/backoff/v4 v4.2.0 // indirect
+	github.com/cenkalti/backoff/v4 v4.2.1 // indirect
 	github.com/cespare/xxhash/v2 v2.2.0 // indirect
 	github.com/cockroachdb/errors v1.8.1 // indirect
 	github.com/cockroachdb/logtags v0.0.0-20190617123548-eb05cc24525f // indirect
